@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$PATH"
+
+# Help avoid CUDA fragmentation on small GPUs.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# ydotool socket location (when daemon runs as root).
+if [[ -z "${YDOTOOL_SOCKET:-}" && -S /tmp/.ydotool_socket ]]; then
+  export YDOTOOL_SOCKET=/tmp/.ydotool_socket
+fi
+
+# Load optional config (WHISPER_MODEL, WHISPER_LANGUAGE, etc.)
+if [[ -f "$HOME/.config/cmd-stt/config" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.config/cmd-stt/config"
+fi
+
+PIDFILE=/tmp/cmd-stt.pid
+AUDIO=/tmp/cmd-stt.wav
+MODE="${1:-toggle}"
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "STT" "$1" || true
+  fi
+}
+
+start_recording() {
+  rm -f "$AUDIO" "$PIDFILE"
+  nohup ffmpeg -y -f pulse -i default -ar 16000 -ac 1 "$AUDIO" >/tmp/cmd-stt-ffmpeg.log 2>&1 &
+  disown 2>/dev/null || true
+  notify "Recording... press stop hotkey when done."
+}
+
+stop_recording() {
+  # Small delay to capture trailing speech before stopping.
+  sleep 0.5
+  pkill -f "ffmpeg -y -f pulse -i default -ar 16000 -ac 1 $AUDIO" 2>/dev/null || true
+  for _ in {1..20}; do
+    pgrep -f "ffmpeg -y -f pulse -i default -ar 16000 -ac 1 $AUDIO" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+
+  if [[ ! -s "$AUDIO" ]]; then
+    notify "No audio recorded"
+    exit 1
+  fi
+
+  local device_args=()
+  local device_label="CPU"
+  if [[ "${WHISPER_DEVICE:-auto}" == "cuda" ]] || { [[ "${WHISPER_DEVICE:-auto}" == "auto" ]] && command -v nvidia-smi >/dev/null 2>&1; }; then
+    device_args=(--device cuda)
+    device_label="GPU (cuda)"
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "${tmpdir:-}"' EXIT
+
+  local lang_args=()
+  if [[ -n "${WHISPER_LANGUAGE:-}" && "${WHISPER_LANGUAGE}" != "auto" ]]; then
+    lang_args=(--language "$WHISPER_LANGUAGE")
+  fi
+
+  local prompt_args=()
+  if [[ -n "${WHISPER_INITIAL_PROMPT:-}" ]]; then
+    prompt_args=(--initial_prompt "$WHISPER_INITIAL_PROMPT")
+  fi
+
+is_online() {
+  curl -s --max-time 2 -o /dev/null https://www.google.com 2>/dev/null
+}
+
+# Determine backend (auto/cloud/local)
+local use_cloud=false
+case "${STT_BACKEND:-auto}" in
+  cloud) use_cloud=true ;;
+  local) use_cloud=false ;;
+  auto)
+    if { [[ -n "${GROQ_API_KEY:-}" ]] || [[ -n "${OPENAI_API_KEY:-}" ]]; } && is_online; then
+      use_cloud=true
+    fi
+    ;;
+esac
+# Determine backend label for notifications
+local backend_label=""
+if $use_cloud; then
+  if [[ -n "${GROQ_API_KEY:-}" ]]; then
+    backend_label="Cloud (Groq: ${GROQ_WHISPER_MODEL:-whisper-large-v3-turbo})"
+  else
+    backend_label="Cloud (OpenAI: ${OPENAI_WHISPER_MODEL:-whisper-1})"
+  fi
+else
+  backend_label="Local (${WHISPER_MODEL:-small}, $device_label)"
+fi
+  if $use_cloud; then
+    local endpoint model key
+    if [[ -n "${GROQ_API_KEY:-}" ]]; then
+      endpoint="https://api.groq.com/openai/v1/audio/transcriptions"
+      model="${GROQ_WHISPER_MODEL:-whisper-large-v3-turbo}"
+      key="$GROQ_API_KEY"
+    else
+      endpoint="https://api.openai.com/v1/audio/transcriptions"
+      model="${OPENAI_WHISPER_MODEL:-whisper-1}"
+      key="$OPENAI_API_KEY"
+    fi
+    notify "Transcribing on $backend_label..."
+    local resp
+    resp=$(curl -s -X POST "$endpoint" \
+      -H "Authorization: Bearer $key" \
+      -F "file=@$AUDIO" \
+      -F "model=$model" \
+      ${WHISPER_LANGUAGE:+-F "language=$WHISPER_LANGUAGE"} \
+      ${WHISPER_INITIAL_PROMPT:+-F "prompt=$WHISPER_INITIAL_PROMPT"})
+    text=$(printf '%s' "$resp" | jq -r '.text // empty' 2>/dev/null || true)
+  elif command -v whisper >/dev/null 2>&1; then
+    notify "Transcribing on $backend_label..."
+    if ! whisper "$AUDIO" --model "${WHISPER_MODEL:-small}" --output_format txt --output_dir "$tmpdir" "${device_args[@]}" "${lang_args[@]}" "${prompt_args[@]}" --no_speech_threshold 0.1 >/tmp/cmd-stt-whisper.log 2>&1; then
+      if grep -q "OutOfMemory" /tmp/cmd-stt-whisper.log 2>/dev/null && [[ " ${device_args[*]} " == *" cuda "* ]]; then
+        notify "GPU OOM, retrying on CPU..."
+        whisper "$AUDIO" --model "${WHISPER_MODEL:-small}" --output_format txt --output_dir "$tmpdir" --device cpu "${lang_args[@]}" "${prompt_args[@]}" --no_speech_threshold 0.1 >/tmp/cmd-stt-whisper.log 2>&1 || true
+      fi
+    fi
+    text=$(cat "$tmpdir"/*.txt 2>/dev/null || true)
+  elif command -v whisper-ctranslate2 >/dev/null 2>&1; then
+    notify "Transcribing on $backend_label..."
+    local ct_args=(--model "${WHISPER_MODEL:-small}" --output_format txt --output_dir "$tmpdir")
+    if [[ -n "${WHISPER_LANGUAGE:-}" && "${WHISPER_LANGUAGE}" != "auto" ]]; then
+      ct_args+=(--language "$WHISPER_LANGUAGE")
+    fi
+    if [[ -n "${WHISPER_INITIAL_PROMPT:-}" ]]; then
+      ct_args+=(--initial_prompt "$WHISPER_INITIAL_PROMPT")
+    fi
+    ct_args+=(--device cpu --compute_type int8 --no_speech_threshold 0.1)
+    whisper-ctranslate2 "$AUDIO" "${ct_args[@]}" >/tmp/cmd-stt-whisper.log 2>&1
+    text=$(cat "$tmpdir"/*.txt 2>/dev/null || true)
+  else
+    notify "whisper not installed"
+    exit 1
+  fi
+
+  text=$(printf '%s' "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+  if [[ -z "$text" ]]; then
+    notify "Empty transcription"
+    exit 1
+  fi
+
+  # Copy to clipboard as silent fallback.
+  if command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "$text" | wl-copy
+  elif command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$text" | xclip -selection clipboard
+  fi
+
+  # Wayland/KDE needs a settle delay before the virtual input device is bound.
+  sleep "${YDOTOOL_SETTLE:-2}"
+
+  # Stream characters via ydotool (auto-type).
+  if command -v ydotool >/dev/null 2>&1; then
+    YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-/tmp/.ydotool_socket}" ydotool type --key-delay=1 "$text" 2>/dev/null || true
+  fi
+
+  notify "Done ($backend_label)"
+}
+
+case "$MODE" in
+  start)
+    start_recording
+    ;;
+  stop)
+    stop_recording
+    ;;
+  toggle)
+    if pgrep -f "ffmpeg -y -f pulse -i default -ar 16000 -ac 1 $AUDIO" >/dev/null 2>&1; then
+      stop_recording
+    else
+      start_recording
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|toggle}" >&2
+    exit 2
+    ;;
+esac

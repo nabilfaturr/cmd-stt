@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Toggle STT Recording
+Exec=/bin/sh -c 'source "$HOME/.config/cmd-stt/config" && "$STT_CMD" toggle'
+Type=Application
+Terminal=false
+Icon=audio-input-microphone
+Categories=Utility;
+NoDisplay=true

@@ -1,0 +1,25 @@
+# Backend: auto (cloud if internet+key available, else local), cloud, or local.
+STT_BACKEND="${STT_BACKEND:-auto}"
+
+# Single variable for the STT command. Change this to point to a different script/binary.
+STT_CMD="${STT_CMD:-$HOME/.local/bin/cmd-stt}"
+
+# Whisper settings (optional).
+# Model: tiny, base, small, medium, large (larger = better but slower).
+WHISPER_MODEL="${WHISPER_MODEL:-small}"
+# Language: auto (default), id (Indonesian), en (English), etc.
+WHISPER_LANGUAGE="${WHISPER_LANGUAGE:-id}"
+# Device: auto (use GPU if available), cpu, cuda.
+WHISPER_DEVICE="${WHISPER_DEVICE:-auto}"
+
+# Cloud ASR (optional, fastest & most accurate). Set one key to enable cloud.
+# GROQ_API_KEY="gsk_..."
+# OPENAI_API_KEY="sk-..."
+GROQ_WHISPER_MODEL="whisper-large-v3-turbo"
+# OPENAI_WHISPER_MODEL="whisper-1"
+
+# Settle delay (seconds) before ydotool types, for Wayland device binding.
+YDOTOOL_SETTLE="${YDOTOOL_SETTLE:-2}"
+
+# Optional bias prompt to improve names/terms.
+WHISPER_INITIAL_PROMPT="${WHISPER_INITIAL_PROMPT:-Halo, perkenalkan nama ku adalah Nabil Faturrahman.}"

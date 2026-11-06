@@ -40,7 +40,7 @@ if [[ -f "$KG" ]]; then
   if lsattr "$KG" 2>/dev/null | grep -q 'i'; then
     chattr -i "$KG" 2>/dev/null || true
   fi
-  python3 - "$KG" <<'PY'
+  if python3 - "$KG" 2>/dev/null <<'PY'
 import sys
 p=sys.argv[1]
 s=open(p).read()
@@ -49,7 +49,11 @@ s=s.replace("_launch=Meta+Ctrl+D","_launch=Meta+Ctrl+Alt+D")
 s=s.replace("_launch=Meta+Ctrl+X","_launch=Meta+Ctrl+Alt+X")
 open(p,"w").write(s)
 PY
-  chattr +i "$KG" 2>/dev/null || true
+  then
+    chattr +i "$KG" 2>/dev/null || true
+  else
+    echo "Warning: could not update KDE shortcuts ($KG) — likely immutable (needs root). Skipping." >&2
+  fi
 fi
 
 kbuildsycoca6 --noincremental 2>/dev/null || true
